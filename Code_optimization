@@ -1,0 +1,81 @@
+import jax.numpy as jnp
+import jax.random as random
+import matplotlib.pyplot as plt
+from jax import vmap, jit, device_put
+
+# Các hằng số
+R = 50  # kpc
+L = 16   # kpc
+z0 = 0
+kappa = 4.429 * 1e-6
+Q_E = 4.175 * 1e30
+t_max = L**2 / (2*kappa)  # τ_max = L^2 / (2κ)
+N_sources = 10**6  # Tăng lên 1 triệu nguồn
+
+# Khởi tạo bộ sinh số ngẫu nhiên
+key = random.PRNGKey(0)
+key_theta, key_r, key_t = random.split(key, 3)
+
+# Gieo điểm (x0, y0) trong hình tròn bán kính R
+theta = random.uniform(key_theta, (N_sources,), minval=0, maxval=2 * jnp.pi)
+r = R * jnp.sqrt(random.uniform(key_r, (N_sources,)))
+x0 = r * jnp.cos(theta)
+y0 = r * jnp.sin(theta)
+
+# Gieo thời gian t0 trong khoảng (0, τ_max)
+t0 = random.uniform(key_t, (N_sources,), minval=0, maxval=t_max)
+
+# Lưới không gian để vẽ bản đồ (giảm xuống 100x100 để tăng tốc)
+grid_size = 500
+x_grid = jnp.linspace(-R, R, grid_size)
+y_grid = jnp.linspace(-R, R, grid_size)
+x_mesh, y_mesh = jnp.meshgrid(x_grid, y_grid, indexing='ij')
+
+# Hàm Green 3D tối ưu hóa
+@jit
+def G(t, x, y, x0, y0, t0, kappa_E):
+    tau = jnp.maximum(t - t0, 1e-6)  # Đảm bảo tau > 0
+    n_values = jnp.arange(-10, 11)  # Giảm số n để tăng tốc
+    zn = 2 * n_values * L + (-1) ** n_values * z0
+    exponent = -((x - x0) ** 2 + (y - y0) ** 2 + zn ** 2) / (4 * kappa_E * tau)
+    psi_n = ((-1) ** n_values * Q_E / ((4 * jnp.pi * kappa_E * tau) ** (3 / 2))) * jnp.exp(exponent)
+    return jnp.sum(psi_n)
+
+# Vector hóa theo (x, y)
+G_vmap = jit(vmap(G, in_axes=(None, 0, 0, None, None, None, None), out_axes=0))
+
+# Tính toán mật độ f_CR
+@jit
+def compute_f_CR(x_mesh, y_mesh, x0, y0, t0, kappa, t_current):
+    def single_source_contribution(x, y, x0, y0, t0):
+        return G_vmap(t_current, x, y, x0, y0, t0, kappa)
+    
+    # Chia batch theo trục nguồn
+    batch_size = 1000  # Tính toán mỗi lần 5000 nguồn để tránh tràn bộ nhớ
+    f_CR_total = jnp.zeros(x_mesh.ravel().shape)
+
+    for i in range(0, len(x0), batch_size):
+        f_CR_partial = vmap(single_source_contribution, in_axes=(None, None, 0, 0, 0))(
+            x_mesh.ravel(), y_mesh.ravel(), x0[i:i+batch_size], y0[i:i+batch_size], t0[i:i+batch_size]
+        )
+        f_CR_total += jnp.sum(f_CR_partial, axis=0)
+
+    return f_CR_total.reshape(x_mesh.shape)
+
+# Đưa dữ liệu lên GPU
+x_mesh, y_mesh = device_put((x_mesh, y_mesh))
+x0, y0, t0 = device_put((x0, y0, t0))
+
+# Tính toán f_CR trên GPU
+t_current = t_max
+f_CR = compute_f_CR(x_mesh, y_mesh, x0, y0, t0, kappa, t_current)
+f_CR = jnp.clip(f_CR, 0, 1e32)
+
+# Vẽ bản đồ
+plt.figure(figsize=(8, 6))
+c = plt.contourf(x_grid, y_grid, jnp.nan_to_num(f_CR), levels=100, cmap='inferno')
+plt.colorbar(c, label='$f_{CR}(x,y,z=0)$')
+plt.xlabel('$x$ (kpc)')
+plt.ylabel('$y$ (kpc)')
+plt.title('The map of cosmic-ray density $f_{CR}(x,y,z=0)$')
+plt.show()  
